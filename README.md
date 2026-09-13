@@ -14,6 +14,10 @@ Desktop GUI (Rust + egui) for browsing git repositories hosted on a Synology NAS
 - Creates new bare repositories on the NAS (`git init --bare`, optionally `--shared=group`), with an
   optional description. Names are restricted to `[A-Za-z0-9._-]`, may not start with `.` or `-`, and
   may not contain `..`, so nothing can escape the chosen root; the `.git` suffix is added if missing.
+- Deletes a repository on the server after a typed-name confirmation. The path must sit inside one
+  of the configured roots and the server re-checks that it really is a git repository before `rm -rf`,
+  so a stale listing or a mistyped root cannot delete anything else. For a working copy the default is
+  to remove only its `.git`; a checkbox removes the whole project directory.
 - Opens a real interactive SSH session in a terminal window — either at the NAS home directory or directly inside a repository — by launching the system `ssh` client.
 - Runs ad-hoc remote commands from the bottom bar.
 

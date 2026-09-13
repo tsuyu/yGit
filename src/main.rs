@@ -35,6 +35,19 @@ struct NewRepo {
     error: String,
 }
 
+/// State of the "delete repository" confirmation dialog.
+struct DeleteRepo {
+    /// The repository directory as listed by the scan.
+    path: String,
+    /// Repository name, which has to be typed back to confirm.
+    name: String,
+    bare: bool,
+    /// Working copies only: remove the project directory, not just `.git`.
+    whole_tree: bool,
+    typed: String,
+    error: String,
+}
+
 #[derive(PartialEq, Eq)]
 enum Conn {
     Idle,
@@ -60,6 +73,7 @@ struct App {
     roots_edit: String,
     exec_input: String,
     new_repo: Option<NewRepo>,
+    delete_repo: Option<DeleteRepo>,
     no_git: bool,
     status: String,
 }
@@ -88,6 +102,7 @@ impl App {
             roots_edit,
             exec_input: String::new(),
             new_repo: None,
+            delete_repo: None,
             no_git: false,
             status: "not connected".to_string(),
         }
@@ -144,6 +159,11 @@ impl App {
                 Evt::Created { path } => {
                     self.new_repo = None;
                     self.status = format!("created {path}");
+                    self.refresh_repos();
+                }
+                Evt::Deleted { path } => {
+                    self.delete_repo = None;
+                    self.status = format!("deleted {path}");
                     self.refresh_repos();
                 }
                 Evt::Detail(path, d) => self.detail = Some((path, d)),
@@ -249,6 +269,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| self.repo_panel(ui));
 
         self.new_repo_window(ctx);
+        self.delete_repo_window(ctx);
     }
 }
 
@@ -479,6 +500,7 @@ impl App {
         let mut want_detail: Option<String> = None;
         let mut want_terminal: Option<String> = None;
         let mut want_copy: Option<String> = None;
+        let mut want_delete: Option<DeleteRepo> = None;
         let profile = self.cfg.current().clone();
 
         egui::ScrollArea::vertical()
@@ -520,6 +542,20 @@ impl App {
                                             }
                                             if ui.small_button("Details").clicked() {
                                                 want_detail = Some(repo.path.clone());
+                                            }
+                                            if ui
+                                                .small_button("Delete")
+                                                .on_hover_text("delete this repository on the server")
+                                                .clicked()
+                                            {
+                                                want_delete = Some(DeleteRepo {
+                                                    path: repo.path.clone(),
+                                                    name: repo.name.clone(),
+                                                    bare: repo.bare,
+                                                    whole_tree: false,
+                                                    typed: String::new(),
+                                                    error: String::new(),
+                                                });
                                             }
                                         },
                                     );
@@ -563,6 +599,9 @@ impl App {
         }
         if let Some(dir) = want_terminal {
             self.open_terminal(Some(dir));
+        }
+        if let Some(dlg) = want_delete {
+            self.delete_repo = Some(dlg);
         }
     }
 
@@ -660,6 +699,100 @@ impl App {
             }
         }
         self.new_repo = Some(dlg);
+    }
+
+    fn delete_repo_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.delete_repo.take() else {
+            return;
+        };
+        let roots = self.cfg.current().repo_roots.clone();
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+
+        let target = ssh::delete_target(&dlg.path, &roots, dlg.whole_tree);
+        let confirmed = dlg.typed.trim() == dlg.name;
+
+        egui::Window::new("Delete repository")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 100, 100),
+                    "This permanently deletes the directory on the server. It cannot be undone.",
+                );
+                ui.add_space(4.0);
+
+                if !dlg.bare {
+                    ui.checkbox(
+                        &mut dlg.whole_tree,
+                        "Delete the whole working copy, not just its .git directory",
+                    );
+                    if !dlg.whole_tree {
+                        ui.small("The working files stay; only the git metadata goes.");
+                    }
+                }
+
+                ui.add_space(4.0);
+                match &target {
+                    Ok(t) => {
+                        ui.label("Will remove:");
+                        ui.monospace(t);
+                    }
+                    Err(e) => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 100, 100), e.to_string());
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.label(format!("Type the repository name ({}) to confirm:", dlg.name));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut dlg.typed)
+                        .hint_text(&dlg.name)
+                        .desired_width(260.0),
+                );
+                submit |= resp.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && confirmed;
+
+                if !dlg.error.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(220, 100, 100), &dlg.error);
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ready = confirmed && target.is_ok();
+                    submit |= ui
+                        .add_enabled(ready, egui::Button::new("Delete"))
+                        .on_disabled_hover_text("type the repository name first")
+                        .clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+
+        if cancel || !open {
+            return;
+        }
+        if submit {
+            match target {
+                Ok(t) if confirmed => {
+                    self.status = format!("deleting {t}...");
+                    self.push_log(format!("deleting {t}"));
+                    let _ = self.cmd_tx.send(Cmd::DeleteRepo {
+                        path: dlg.path.clone(),
+                        roots,
+                        whole_tree: dlg.whole_tree,
+                    });
+                    dlg.error.clear();
+                }
+                Ok(_) => dlg.error = "the typed name does not match".to_string(),
+                Err(e) => dlg.error = e.to_string(),
+            }
+        }
+        self.delete_repo = Some(dlg);
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {

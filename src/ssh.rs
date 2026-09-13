@@ -105,6 +105,15 @@ pub enum Cmd {
         description: String,
         shared: bool,
     },
+    DeleteRepo {
+        /// The repository directory as reported by the scan.
+        path: String,
+        /// Roots the path must live under; the server refuses anything else.
+        roots: Vec<String>,
+        /// For a working copy, delete the whole project directory instead of
+        /// just its `.git`.
+        whole_tree: bool,
+    },
     Disconnect,
 }
 
@@ -118,6 +127,7 @@ pub enum Evt {
     Detail(String, RepoDetail),
     Output { label: String, text: String },
     Created { path: String },
+    Deleted { path: String },
     Busy(bool),
 }
 
@@ -280,6 +290,20 @@ async fn worker(
                         bridge.send(Evt::Created { path });
                     }
                     Err(e) => bridge.send(Evt::Failed(format!("create failed: {e:#}"))),
+                },
+                None => bridge.send(Evt::Failed("not connected".into())),
+            },
+            Cmd::DeleteRepo {
+                path,
+                roots,
+                whole_tree,
+            } => match session.as_ref() {
+                Some(h) => match delete_repo(h, &path, &roots, whole_tree).await {
+                    Ok(removed) => {
+                        bridge.send(Evt::Log(format!("deleted {removed}")));
+                        bridge.send(Evt::Deleted { path: removed });
+                    }
+                    Err(e) => bridge.send(Evt::Failed(format!("delete failed: {e:#}"))),
                 },
                 None => bridge.send(Evt::Failed("not connected".into())),
             },
@@ -747,6 +771,91 @@ async fn create_repo(
     })
 }
 
+/// Works out what a delete actually removes, and checks the target is a
+/// repository directory that lives under one of the configured roots.
+///
+/// `path` is the directory the scan reported: a bare repository, or the `.git`
+/// of a working copy. With `whole_tree` the working copy's project directory is
+/// removed instead of only its `.git`.
+pub fn delete_target(path: &str, roots: &[String], whole_tree: bool) -> Result<String> {
+    let path = path.trim().trim_end_matches('/');
+    if path.is_empty() || !path.starts_with('/') {
+        return Err(anyhow!("repository path must be absolute"));
+    }
+    if path.split('/').any(|c| c == ".." || c == ".") {
+        return Err(anyhow!("repository path may not contain '.' or '..'"));
+    }
+
+    let target = match path.strip_suffix("/.git") {
+        Some(tree) if whole_tree => tree,
+        _ if whole_tree => return Err(anyhow!("only a working copy has a working tree")),
+        _ => path,
+    };
+    if target.is_empty() || target == "/" {
+        return Err(anyhow!("refusing to delete the filesystem root"));
+    }
+
+    // The target has to sit strictly inside a configured root, so a typo in the
+    // path can never turn into a delete somewhere else on the NAS.
+    let inside = roots.iter().any(|r| {
+        let r = r.trim().trim_end_matches('/');
+        !r.is_empty() && r.starts_with('/') && target.starts_with(&format!("{r}/"))
+    });
+    if !inside {
+        return Err(anyhow!(
+            "{target} is not inside any configured repository root"
+        ));
+    }
+    Ok(target.to_string())
+}
+
+/// Builds the shell script that removes `target`, plus the path it removes.
+///
+/// The script re-checks on the server that the directory is really a git
+/// repository (or, for a whole working copy, holds one), so a stale listing
+/// cannot make it delete an unrelated directory.
+fn delete_script(path: &str, roots: &[String], whole_tree: bool) -> Result<(String, String)> {
+    let target = delete_target(path, roots, whole_tree)?;
+    let check = if whole_tree {
+        "[ -d \"$d/.git\" ] || { echo 'not a working copy (no .git directory); refusing to delete'; exit 6; }\n"
+    } else {
+        concat!(
+            "{ [ -f \"$d/HEAD\" ] && [ -d \"$d/objects\" ] && [ -d \"$d/refs\" ]; } || ",
+            "{ echo 'not a git repository; refusing to delete'; exit 6; }\n"
+        )
+    };
+    let script = format!(
+        concat!(
+            "d={}\n",
+            "[ -d \"$d\" ] || {{ echo 'the directory no longer exists'; exit 5; }}\n",
+            "{}",
+            "rm -rf -- \"$d\" || {{ echo 'could not delete (permissions?)'; exit 7; }}\n",
+            "[ -e \"$d\" ] && {{ echo 'the directory is still there after rm'; exit 8; }}\n",
+            "echo \"$d\"\n"
+        ),
+        shq(&target),
+        check
+    );
+    Ok((target, script))
+}
+
+/// Deletes a repository on the server and returns the path that was removed.
+async fn delete_repo(
+    handle: &Handle<Client>,
+    path: &str,
+    roots: &[String],
+    whole_tree: bool,
+) -> Result<String> {
+    let (target, script) = delete_script(path, roots, whole_tree)?;
+    let out = run(handle, &script).await?;
+    let reported = out.trim();
+    Ok(if reported.is_empty() {
+        target
+    } else {
+        reported.to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +975,54 @@ ref: refs/heads/main
     #[test]
     fn root_must_be_absolute() {
         assert!(create_script("relative/path", "x", "", false).is_err());
+    }
+
+    #[test]
+    fn delete_only_touches_repositories_under_a_root() {
+        let roots = vec!["/volume1/git".to_string(), "/volume1/homes/".to_string()];
+
+        assert_eq!(
+            delete_target("/volume1/git/a.git", &roots, false).unwrap(),
+            "/volume1/git/a.git"
+        );
+        // A working copy deletes its .git by default, the project dir on demand.
+        assert_eq!(
+            delete_target("/volume1/homes/me/proj/.git", &roots, false).unwrap(),
+            "/volume1/homes/me/proj/.git"
+        );
+        assert_eq!(
+            delete_target("/volume1/homes/me/proj/.git", &roots, true).unwrap(),
+            "/volume1/homes/me/proj"
+        );
+
+        for bad in [
+            "",
+            "relative/a.git",
+            "/",
+            "/volume1/git",           // the root itself
+            "/volume1/gitolite/a.git", // shares a prefix but is not inside
+            "/etc",
+            "/volume1/git/../../etc",
+        ] {
+            assert!(delete_target(bad, &roots, false).is_err(), "accepted {bad:?}");
+        }
+        // A bare repository has no working tree to delete.
+        assert!(delete_target("/volume1/git/a.git", &roots, true).is_err());
+    }
+
+    #[test]
+    fn delete_script_quotes_and_verifies() {
+        let roots = vec!["/volume1/git".to_string()];
+        let (target, script) = delete_script("/volume1/git/it's.git", &roots, false).unwrap();
+        assert_eq!(target, "/volume1/git/it's.git");
+        assert!(script.contains(r"d='/volume1/git/it'\''s.git'"));
+        assert!(script.contains("not a git repository"));
+        assert!(script.contains("rm -rf -- \"$d\""));
+
+        let (target, script) =
+            delete_script("/volume1/git/proj/.git", &roots, true).unwrap();
+        assert_eq!(target, "/volume1/git/proj");
+        assert!(script.contains("not a working copy"));
     }
 }
 
