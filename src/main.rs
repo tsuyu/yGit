@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod proxy;
 mod ssh;
 mod terminal;
 
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use config::{AuthKind, Config, Profile};
 use eframe::egui;
@@ -12,6 +13,12 @@ use ssh::{Cmd, Evt, Repo, RepoDetail};
 use tokio::sync::mpsc::UnboundedSender;
 
 fn main() -> eframe::Result<()> {
+    // git runs this same binary as its SSH transport for password profiles.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(proxy::FLAG) {
+        std::process::exit(proxy::run(&args[1..]));
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1080.0, 700.0])
@@ -48,6 +55,23 @@ struct DeleteRepo {
     error: String,
 }
 
+/// State of the "clone repository" dialog.
+struct CloneRepo {
+    /// The repository directory on the server.
+    path: String,
+    /// The `ssh://` URL git is given.
+    url: String,
+    /// Destination directory on this machine.
+    parent: String,
+    /// Folder created inside `parent`.
+    folder: String,
+    /// Branch to check out; empty follows the server's HEAD.
+    branch: String,
+    /// Branches offered in the dropdown, filled in once the server answers.
+    branches: Vec<String>,
+    error: String,
+}
+
 #[derive(PartialEq, Eq)]
 enum Conn {
     Idle,
@@ -58,9 +82,16 @@ enum Conn {
 struct App {
     cfg: Config,
     password: String,
+    /// The password of the live session, kept in memory so a clone can
+    /// authenticate without asking again. Never written to disk, and dropped
+    /// the moment the session ends.
+    session_password: String,
     passphrase: String,
     cmd_tx: UnboundedSender<Cmd>,
+    evt_tx: Sender<Evt>,
     evt_rx: Receiver<Evt>,
+    /// Handed to worker threads so they can wake the UI.
+    ctx: egui::Context,
     conn: Conn,
     busy: bool,
     banner: String,
@@ -74,6 +105,11 @@ struct App {
     exec_input: String,
     new_repo: Option<NewRepo>,
     delete_repo: Option<DeleteRepo>,
+    clone_repo: Option<CloneRepo>,
+    /// Set while a local `git clone` is running.
+    cloning: bool,
+    /// Destination folder of the last clone, offered again next time.
+    last_clone_parent: Option<String>,
     no_git: bool,
     status: String,
 }
@@ -83,10 +119,13 @@ impl App {
         let cfg = Config::load();
         let roots_edit = cfg.current().repo_roots.join("\n");
         let (evt_tx, evt_rx) = channel();
-        let cmd_tx = ssh::spawn(evt_tx, ctx);
+        let cmd_tx = ssh::spawn(evt_tx.clone(), ctx.clone());
         Self {
             cfg,
+            evt_tx,
+            ctx,
             password: String::new(),
+            session_password: String::new(),
             passphrase: String::new(),
             cmd_tx,
             evt_rx,
@@ -103,6 +142,9 @@ impl App {
             exec_input: String::new(),
             new_repo: None,
             delete_repo: None,
+            clone_repo: None,
+            cloning: false,
+            last_clone_parent: None,
             no_git: false,
             status: "not connected".to_string(),
         }
@@ -125,7 +167,7 @@ impl App {
                     self.banner = banner;
                     self.status = "connected".to_string();
                     self.push_log("connected");
-                    self.password.clear();
+                    self.session_password = std::mem::take(&mut self.password);
                     self.passphrase.clear();
                     self.refresh_repos();
                 }
@@ -135,6 +177,7 @@ impl App {
                     self.repos.clear();
                     self.selected = None;
                     self.detail = None;
+                    self.session_password.clear();
                     self.status = "disconnected".to_string();
                     self.push_log("disconnected");
                 }
@@ -166,7 +209,25 @@ impl App {
                     self.status = format!("deleted {path}");
                     self.refresh_repos();
                 }
-                Evt::Detail(path, d) => self.detail = Some((path, d)),
+                Evt::Cloned { dest } => {
+                    self.cloning = false;
+                    self.clone_repo = None;
+                    self.status = format!("cloned into {dest}");
+                }
+                Evt::CloneFailed(e) => {
+                    self.cloning = false;
+                    self.status = format!("clone failed: {e}");
+                    self.push_log(format!("ERROR {e}"));
+                    if let Some(dlg) = self.clone_repo.as_mut() {
+                        dlg.error = e;
+                    }
+                }
+                Evt::Detail(path, d) => {
+                    if let Some(dlg) = self.clone_repo.as_mut().filter(|c| c.path == path) {
+                        dlg.branches = d.branches.clone();
+                    }
+                    self.detail = Some((path, d));
+                }
                 Evt::Output { label, text } => {
                     self.push_log(format!("{label} done"));
                     self.output = Some((label, text));
@@ -270,6 +331,7 @@ impl eframe::App for App {
 
         self.new_repo_window(ctx);
         self.delete_repo_window(ctx);
+        self.clone_repo_window(ctx);
     }
 }
 
@@ -501,6 +563,7 @@ impl App {
         let mut want_terminal: Option<String> = None;
         let mut want_copy: Option<String> = None;
         let mut want_delete: Option<DeleteRepo> = None;
+        let mut want_clone: Option<CloneRepo> = None;
         let profile = self.cfg.current().clone();
 
         egui::ScrollArea::vertical()
@@ -534,6 +597,23 @@ impl App {
                                                         .to_string()
                                                 };
                                                 want_terminal = Some(dir);
+                                            }
+                                            if ui
+                                                .small_button("Clone")
+                                                .on_hover_text("clone to a folder on this computer")
+                                                .clicked()
+                                            {
+                                                want_clone = Some(CloneRepo {
+                                                    path: repo.path.clone(),
+                                                    url: terminal::clone_url(
+                                                        &profile, &repo.path,
+                                                    ),
+                                                    parent: String::new(),
+                                                    folder: terminal::clone_dir_name(&repo.path),
+                                                    branch: String::new(),
+                                                    branches: Vec::new(),
+                                                    error: String::new(),
+                                                });
                                             }
                                             if ui.small_button("Copy URL").clicked() {
                                                 want_copy = Some(terminal::clone_url(
@@ -602,6 +682,23 @@ impl App {
         }
         if let Some(dlg) = want_delete {
             self.delete_repo = Some(dlg);
+        }
+        if let Some(mut dlg) = want_clone {
+            // Start in the folder used last, when one is still around.
+            if let Some(last) = self.last_clone_parent.clone() {
+                dlg.parent = last;
+            }
+            match self.detail.as_ref() {
+                // The branches are already here when the repository is open.
+                Some((path, d)) if *path == dlg.path => dlg.branches = d.branches.clone(),
+                // Otherwise ask; Evt::Detail fills the dropdown when it lands.
+                _ => {
+                    let _ = self.cmd_tx.send(Cmd::Detail {
+                        path: dlg.path.clone(),
+                    });
+                }
+            }
+            self.clone_repo = Some(dlg);
         }
     }
 
@@ -793,6 +890,217 @@ impl App {
             }
         }
         self.delete_repo = Some(dlg);
+    }
+
+    fn clone_repo_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.clone_repo.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        let mut browse = false;
+        let busy = self.cloning;
+        let password_auth = self.cfg.current().auth == AuthKind::Password;
+        let have_password = !self.session_password.is_empty();
+        // The branch list arrives with the repository detail.
+        let branches_loaded = matches!(self.detail.as_ref(), Some((p, _)) if *p == dlg.path);
+
+        let target = terminal::clone_args(
+            &dlg.path,
+            &dlg.url,
+            std::path::Path::new(&dlg.parent),
+            &dlg.folder,
+            &dlg.branch,
+        )
+        .map(|(dest, _)| dest);
+
+        egui::Window::new("Clone repository")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(480.0);
+                ui.label("Source");
+                ui.monospace(&dlg.url);
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Destination");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dlg.parent)
+                            .hint_text("folder on this computer")
+                            .desired_width(280.0),
+                    );
+                    browse |= ui.button("Browse...").clicked();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Folder");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut dlg.folder)
+                            .hint_text(terminal::clone_dir_name(&dlg.path))
+                            .desired_width(280.0),
+                    );
+                    submit |=
+                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Branch");
+                    let shown = if dlg.branch.trim().is_empty() {
+                        "(server default)".to_string()
+                    } else {
+                        dlg.branch.clone()
+                    };
+                    egui::ComboBox::from_id_salt("clone_branch")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut dlg.branch,
+                                String::new(),
+                                "(server default)",
+                            );
+                            for b in &dlg.branches {
+                                ui.selectable_value(&mut dlg.branch, b.clone(), b);
+                            }
+                        });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dlg.branch)
+                            .hint_text("or type a branch")
+                            .desired_width(160.0),
+                    );
+                });
+                if dlg.branches.is_empty() {
+                    ui.small(if branches_loaded {
+                        "The server reported no branches; leave the branch empty."
+                    } else {
+                        "reading the branch list from the server..."
+                    });
+                }
+
+                ui.add_space(4.0);
+                match &target {
+                    Ok(dest) if !dlg.parent.trim().is_empty() => {
+                        ui.small(format!("will clone into {}", dest.display()));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 100, 100), e.to_string());
+                    }
+                }
+
+                if password_auth {
+                    if have_password {
+                        ui.small(
+                            "This profile logs in with a password, so the clone goes through                              yGit's own SSH transport using the password of this session.",
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 190, 80),
+                            "This profile logs in with a password and none is held: connect                              first, then clone.",
+                        );
+                    }
+                }
+                if !dlg.error.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(220, 100, 100), &dlg.error);
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ready = target.is_ok()
+                        && !dlg.parent.trim().is_empty()
+                        && !busy
+                        && (!password_auth || have_password);
+                    submit |= ui
+                        .add_enabled(ready, egui::Button::new("Clone"))
+                        .on_disabled_hover_text("choose a destination folder first")
+                        .clicked();
+                    cancel |= ui.button(if busy { "Close" } else { "Cancel" }).clicked();
+                    if busy {
+                        ui.spinner();
+                        ui.label("cloning...");
+                    }
+                });
+            });
+
+        if browse {
+            let start = if dlg.parent.trim().is_empty() {
+                dirs::home_dir()
+            } else {
+                Some(std::path::PathBuf::from(dlg.parent.trim()))
+            };
+            let mut picker = rfd::FileDialog::new();
+            if let Some(dir) = start.filter(|d| d.is_dir()) {
+                picker = picker.set_directory(dir);
+            }
+            if let Some(dir) = picker.pick_folder() {
+                dlg.parent = dir.to_string_lossy().to_string();
+                dlg.error.clear();
+            }
+        }
+
+        if cancel || !open {
+            return;
+        }
+        if submit && !busy {
+            match target {
+                Ok(dest) => {
+                    dlg.error.clear();
+                    self.last_clone_parent = Some(dlg.parent.clone());
+                    self.cloning = true;
+                    self.status = format!("cloning into {}...", dest.display());
+                    let on = if dlg.branch.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (branch {})", dlg.branch.trim())
+                    };
+                    self.push_log(format!(
+                        "git clone {} -> {}{on}",
+                        dlg.url,
+                        dest.display()
+                    ));
+                    self.start_clone(&dlg);
+                }
+                Err(e) => dlg.error = e.to_string(),
+            }
+        }
+        self.clone_repo = Some(dlg);
+    }
+
+    /// Runs `git clone` on a worker thread so the window keeps painting.
+    fn start_clone(&self, dlg: &CloneRepo) {
+        let profile = self.cfg.current().clone();
+        let (path, url, parent, folder, branch) = (
+            dlg.path.clone(),
+            dlg.url.clone(),
+            std::path::PathBuf::from(dlg.parent.trim()),
+            dlg.folder.clone(),
+            dlg.branch.trim().to_string(),
+        );
+        let password = self.session_password.clone();
+        let tx = self.evt_tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let evt = match terminal::clone_repo(
+                &profile, &path, &url, &parent, &folder, &branch, &password,
+            ) {
+                Ok((dest, text)) => {
+                    if !text.trim().is_empty() {
+                        let _ = tx.send(Evt::Output {
+                            label: format!("git clone {url}"),
+                            text,
+                        });
+                    }
+                    Evt::Cloned {
+                        dest: dest.to_string_lossy().to_string(),
+                    }
+                }
+                Err(e) => Evt::CloneFailed(format!("{e:#}")),
+            };
+            let _ = tx.send(evt);
+            ctx.request_repaint();
+        });
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {

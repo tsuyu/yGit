@@ -128,10 +128,14 @@ pub enum Evt {
     Output { label: String, text: String },
     Created { path: String },
     Deleted { path: String },
+    /// A local `git clone` finished; `dest` is the directory it wrote.
+    Cloned { dest: String },
+    /// A local `git clone` failed.
+    CloneFailed(String),
     Busy(bool),
 }
 
-struct Client {
+pub struct Client {
     host: String,
     port: u16,
     strict: bool,
@@ -232,7 +236,7 @@ async fn worker(
                 profile,
                 password,
                 passphrase,
-            } => match connect(&profile, &password, &passphrase, &bridge).await {
+            } => match connect(&profile, &password, &passphrase, &log_forwarder(&bridge)).await {
                 Ok(handle) => {
                     let probe = "uname -a; git --version 2>/dev/null || echo 'git: not found in PATH'";
                     let banner = run(&handle, probe)
@@ -320,11 +324,14 @@ async fn worker(
     }
 }
 
-async fn connect(
+/// Opens an authenticated session. `log` receives the progress lines; the UI
+/// feeds it through [`log_forwarder`], the git transport proxy prints them to
+/// stderr.
+pub async fn connect(
     profile: &Profile,
     password: &str,
     passphrase: &str,
-    bridge: &Bridge,
+    log: &UnboundedSender<Evt>,
 ) -> Result<Handle<Client>> {
     if profile.host.trim().is_empty() {
         return Err(anyhow!("host is empty"));
@@ -343,10 +350,10 @@ async fn connect(
         host: profile.host.clone(),
         port: profile.port,
         strict: profile.strict_host_key,
-        log: log_forwarder(bridge),
+        log: log.clone(),
     };
 
-    bridge.send(Evt::Log(format!(
+    let _ = log.send(Evt::Log(format!(
         "connecting to {}@{}:{}",
         profile.user, profile.host, profile.port
     )));
@@ -366,7 +373,7 @@ async fn connect(
             if !res.success() {
                 return Err(anyhow!("password rejected by server"));
             }
-            bridge.send(Evt::Log("authenticated with password".into()));
+            let _ = log.send(Evt::Log("authenticated with password".into()));
         }
         AuthKind::Key => {
             let candidates: Vec<std::path::PathBuf> = if profile.key_path.trim().is_empty() {
@@ -398,7 +405,10 @@ async fn connect(
                     )
                     .await?;
                 if res.success() {
-                    bridge.send(Evt::Log(format!("authenticated with {}", key_path.display())));
+                    let _ = log.send(Evt::Log(format!(
+                        "authenticated with {}",
+                        key_path.display()
+                    )));
                     ok = true;
                     break;
                 }
